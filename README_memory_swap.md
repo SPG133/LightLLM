@@ -12,6 +12,7 @@
 - `memory_scheduler` 模块目录
 - 第一版 `fair_pause` 调度器
 - 在 backend 中接入 victim selection
+- 在请求对象上补充等待债务和恢复保护状态
 
 当前还**没有**完成：
 
@@ -79,6 +80,43 @@
   - 然后再尝试让当前请求进入 prefill/decode 队列
 - 在恢复 paused 请求前，会先经过 `select_resume_reqs(...)`
 
+### 2.4 在请求对象上补充调度状态
+
+修改文件：
+
+- [lightllm/server/router/model_infer/infer_batch.py](./lightllm/server/router/model_infer/infer_batch.py)
+
+新增状态字段：
+
+- `pause_count`
+- `enqueue_ts`
+- `last_pause_ts`
+- `last_resume_ts`
+- `total_wait_time`
+- `output_tokens_at_resume`
+
+这些字段的作用是：
+
+- `pause_count`
+  - 记录请求被牺牲了多少次
+- `enqueue_ts`
+  - 预留给后续更精细的等待时间分析
+- `last_pause_ts`
+  - 记录最近一次 pause 的时间
+- `last_resume_ts`
+  - 记录最近一次恢复的时间
+- `total_wait_time`
+  - 累积请求在 paused 状态下的等待时间
+- `output_tokens_at_resume`
+  - 用来判断请求恢复后是否已经取得足够进度，避免刚恢复又立刻被再次暂停
+
+另外，在：
+
+- `pause_reqs()`
+- `recover_paused_reqs()`
+
+中已经接入这些状态的更新逻辑。
+
 ## 3. 当前逻辑和原版 LightLLM 的区别
 
 原版 LightLLM 在显存不足时，更接近：
@@ -101,33 +139,115 @@
 
 ## 4. 当前 `fair_pause` 的策略
 
-当前的 `FairPauseMemoryScheduler` 是一个很简单的第一版启发式实现。
+当前的 `FairPauseMemoryScheduler` 已经不是最初那种“只看谁的 KV 更大”的简单启发式了。
 
-victim score 规则：
+它现在综合考虑四类因素：
+
+- 释放收益：这个 victim 让出的 KV 是否对当前缺口有足够帮助
+- 重算代价：pause 这个 victim 后，将来恢复重算会有多贵
+- 等待债务：这个 victim 是否已经被拖了太久
+- 反饥饿保护：它是否最近刚恢复、刚被 pause 过，或者恢复后还没取得足够进度
+
+可以把它概括成：
 
 ```text
-score = cur_kv_len + 0.25 * cur_output_len
+victim_score =
+    release_usefulness
+  - recompute_penalty
+  - starvation_penalty
 ```
 
-含义：
+### 4.1 释放收益 `release_usefulness`
 
-- `cur_kv_len` 越大，越适合作为 victim
-- `cur_output_len` 越大，越偏向长尾任务，也更容易成为 victim
+当前实现中，victim 让出的 KV 不是越大越好，而是：
 
-当前只筛选：
+- 太小：对当前请求帮助不够，不值得抢占
+- 接近当前显存缺口：收益最好
+- 过大：会产生过度牺牲，收益反而下降
 
-- `cur_kv_len > 0`
-- 还没有 `paused`
-- 还没有 `wait_pause`
-- 还没有 finished
+也就是说，它已经不是“最大请求优先”，而更接近：
 
-这只是第一版占位策略，后面应继续扩展：
+```text
+有效释放优先
+```
 
-- 用户公平性
-- 最近是否刚被 pause/recover
-- 请求等待时间
-- 交互优先级
-- idle / tool-wait 等状态
+### 4.2 重算代价 `recompute_penalty`
+
+当前实现中，重算代价近似依赖于：
+
+- 当前逻辑完成度
+- 当前 `cur_kv_len`
+
+这里没有再沿用最初“只看显存大小”的方式，而是近似考虑：
+
+- `cur_output_len / max_new_tokens`
+- `cur_kv_len / (input_len + max_new_tokens)`
+
+所以：
+
+- 越接近完成的请求，越不适合作为 victim
+- 当前 KV 越大，越不适合作为 victim
+
+### 4.3 等待债务 `wait_debt`
+
+当前实现引入了等待债务：
+
+```text
+wait_debt = accumulated_wait / estimated_standalone_latency
+```
+
+这表示：
+
+- 不是只看一个请求绝对等了多久
+- 而是看相对于它本来应有的完成时间，它已经被拖得多惨
+
+### 4.4 反饥饿保护 `starvation_penalty`
+
+当前实现里，以下情况都会提高 victim 惩罚：
+
+- `pause_count` 很高
+- `wait_debt` 很高
+- 最近刚恢复，处于冷却期
+- 恢复后还没取得足够输出进度
+
+这能缓解两种问题：
+
+- 长任务反复被牺牲
+- 一个请求刚恢复又立刻被再次 pause
+
+### 4.5 victim 选择流程
+
+当前 `select_victims()` 的流程是：
+
+1. 先算当前显存缺口 `gap`
+2. 过滤掉：
+   - 已经 paused
+   - 已经 `wait_pause`
+   - 已 finished
+   - 刚恢复且还在冷却期的请求
+3. 优先尝试寻找：
+   - 单个就能覆盖 gap
+   - 且净收益更合理的 victim
+4. 如果找不到合适的单个 victim：
+   - 再按 `victim_score` 贪心组合多个 victim
+
+所以当前策略已经不是：
+
+```text
+谁的 KV 最大就暂停谁
+```
+
+也不是：
+
+```text
+哪个请求先撞上资源不足，哪个请求自己暂停
+```
+
+而是：
+
+```text
+优先选择释放收益高、重算代价低、等待债务低、且不容易造成饥饿的 victim
+```
 
 ## 5. 当前 `fair_swap` 的状态
 
@@ -244,6 +364,7 @@ lightllm/server/router/memory_scheduler/active_swap_manager.py
 
 - 作为显存调度改造起点
 - 验证 memory-aware pause 的行为
+- 验证“释放收益 + 重算代价 + 等待债务 + 反饥饿保护”这套 victim 选择思路
 - 继续开发 active KV swap
 - 把 VTC 风格的公平调度思想迁移到 LightLLM
 

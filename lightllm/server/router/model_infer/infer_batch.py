@@ -1,4 +1,5 @@
 import enum
+import time
 import torch
 import torch.distributed as dist
 import numpy as np
@@ -307,6 +308,10 @@ class InferenceContext:
                 assert req.wait_pause is True
                 req.wait_pause = False
                 req.paused = True
+                req.pause_count += 1
+                req.last_pause_ts = time.time()
+                if req.last_resume_ts > 0:
+                    req.total_wait_time += max(0.0, req.last_pause_ts - req.last_resume_ts)
                 if is_master_in_dp:
                     req.shm_req.is_paused = True
                     logger.debug(f"infer paused req id {req.req_id}")
@@ -334,6 +339,8 @@ class InferenceContext:
 
                 assert req.paused is True
                 req.paused = False
+                req.last_resume_ts = time.time()
+                req.output_tokens_at_resume = req.cur_output_len
                 if is_master_in_dp:
                     req.shm_req.is_paused = False
                     logger.debug(f"infer recover paused req id {req.req_id}")
@@ -518,6 +525,12 @@ class InferReq:
         self.wait_pause = False
         # 请求已经被暂停
         self.paused = False
+        self.pause_count = 0
+        self.enqueue_ts = time.time()
+        self.last_pause_ts = 0.0
+        self.last_resume_ts = 0.0
+        self.total_wait_time = 0.0
+        self.output_tokens_at_resume = 0
 
         self.infer_aborted = False
         self.filter_mark = False
