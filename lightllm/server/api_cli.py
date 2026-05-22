@@ -772,6 +772,37 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="""Enable prefix prompt cache fetch for data parallel inference, disabled by default.""",
     )
     parser.add_argument(
+        "--mem_scheduler",
+        type=str,
+        default="none",
+        choices=["none", "fair_pause", "fair_swap"],
+        help="""Memory-aware scheduler policy.""",
+    )
+    parser.add_argument(
+        "--enable_active_kv_swap",
+        action="store_true",
+        default=False,
+        help="""Enable the active request KV swap framework.""",
+    )
+    parser.add_argument(
+        "--swap_block_size",
+        type=int,
+        default=128,
+        help="""Block size in tokens for active KV swap.""",
+    )
+    parser.add_argument(
+        "--swap_threshold_tokens",
+        type=int,
+        default=4096,
+        help="""Minimum KV length to consider swap-based handling.""",
+    )
+    parser.add_argument(
+        "--victim_policy",
+        type=str,
+        default="kv_idle_fair",
+        help="""Victim selection policy for memory-aware scheduling.""",
+    )
+    parser.add_argument(
         "--linear_att_hash_page_size",
         type=int,
         default=512,

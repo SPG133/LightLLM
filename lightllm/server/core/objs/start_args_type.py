@@ -181,6 +181,11 @@ class StartArgs:
     disk_cache_storage_size: float = field(default=10)
     disk_cache_dir: Optional[str] = field(default=None)
     enable_dp_prompt_cache_fetch: bool = field(default=False)
+    mem_scheduler: str = field(default="none")
+    enable_active_kv_swap: bool = field(default=False)
+    swap_block_size: int = field(default=128)
+    swap_threshold_tokens: int = field(default=4096)
+    victim_policy: str = field(default="kv_idle_fair")
     # zmp ports
     router_port: int = field(default=None)
     detokenization_port: int = field(default=None)

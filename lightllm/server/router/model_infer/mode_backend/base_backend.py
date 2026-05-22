@@ -50,11 +50,13 @@ from lightllm.server.router.model_infer.mode_backend.generic_post_process import
 from lightllm.common.basemodel.triton_kernel.gather_token_id import scatter_token
 from lightllm.server.pd_io_struct import NIXLChunckedTransTaskRet
 from .multi_level_kv_cache import MultiLevelKvCacheModule
+from lightllm.server.router.memory_scheduler import build_memory_scheduler
 
 
 class ModeBackend:
     def __init__(self) -> None:
         self.shm_req_manager = ShmReqManager()
+        self.memory_scheduler = build_memory_scheduler(get_env_start_args())
 
         self.overlap_event_manager = OverlapEventManager()
         # 标识是否支持 overlap 功能，很多子类模式如 xgrammar 和 outlines 当前不支持 overlap 高性能模式
@@ -588,6 +590,7 @@ class ModeBackend:
         finished_reqs = []
         prefill_reqs = []
         decode_reqs = []
+        running_reqs = []
 
         # 一次性最多暂停请求的数量, 防止盲目暂停大量请求
         # 因为部分请求释放占用的token容量后，就会使推理可以正常进行。
@@ -625,6 +628,8 @@ class ModeBackend:
                     finished_reqs.append(req_obj)
                     continue
 
+            running_reqs.append(req_obj)
+
             if no_decode:
                 is_decode = False
             else:
@@ -638,8 +643,26 @@ class ModeBackend:
                     decode_reqs.append(req_obj)
                     can_alloc_token_num -= token_num
                 else:
-                    if wait_pause_count < pause_max_req_num:
+                    victims = self.memory_scheduler.select_victims(
+                        running_reqs=running_reqs,
+                        need_token_num=token_num,
+                        can_alloc_token_num=can_alloc_token_num,
+                    )
+                    for victim in victims:
+                        if wait_pause_count >= pause_max_req_num:
+                            break
+                        if victim is req_obj or victim.wait_pause:
+                            continue
+                        victim.wait_pause = True
+                        wait_pause_reqs.append(victim)
+                        wait_pause_count += 1
+                        can_alloc_token_num += victim.cur_kv_len
+                    if token_num <= can_alloc_token_num:
+                        decode_reqs.append(req_obj)
+                        can_alloc_token_num -= token_num
+                    elif wait_pause_count < pause_max_req_num:
                         req_obj.wait_pause = True
+                        wait_pause_reqs.append(req_obj)
                         wait_pause_count += 1
             else:
                 # 在 diverse mode 模式下，prefill 只会使用 master 状态的请求，slave 请求依靠后续
@@ -656,8 +679,27 @@ class ModeBackend:
                     prefill_reqs.append(req_obj)
                     can_alloc_token_num -= token_num
                 else:
-                    if wait_pause_count < pause_max_req_num:
+                    victims = self.memory_scheduler.select_victims(
+                        running_reqs=running_reqs,
+                        need_token_num=token_num,
+                        can_alloc_token_num=can_alloc_token_num,
+                    )
+                    for victim in victims:
+                        if wait_pause_count >= pause_max_req_num:
+                            break
+                        if victim is req_obj or victim.wait_pause:
+                            continue
+                        victim.wait_pause = True
+                        wait_pause_reqs.append(victim)
+                        wait_pause_count += 1
+                        can_alloc_token_num += victim.cur_kv_len
+                    if token_num <= can_alloc_token_num:
+                        prefill_tokens += token_num
+                        prefill_reqs.append(req_obj)
+                        can_alloc_token_num -= token_num
+                    elif wait_pause_count < pause_max_req_num:
                         req_obj.wait_pause = True
+                        wait_pause_reqs.append(req_obj)
                         wait_pause_count += 1
 
         g_infer_state_lock.release()
@@ -675,6 +717,9 @@ class ModeBackend:
         g_infer_context.pause_reqs(wait_pause_reqs, is_master_in_dp=self.is_master_in_dp)
 
         if recover_paused:
+            paused_reqs = self.memory_scheduler.select_resume_reqs(
+                paused_reqs=paused_reqs, can_alloc_token_num=can_alloc_token_num
+            )
             g_infer_context.recover_paused_reqs(
                 paused_reqs=paused_reqs, is_master_in_dp=self.is_master_in_dp, can_alloc_token_num=can_alloc_token_num
             )
