@@ -60,18 +60,29 @@ class FairPauseMemoryScheduler(MemoryScheduler):
             penalty += 3.0
         return penalty
 
-    def _release_usefulness(self, req, gap: int) -> float:
+    def _release_usefulness(self, req, gap: int, need_token_num: int) -> float:
         if gap <= 0:
             return 0.0
         released = float(req.cur_kv_len)
-        if released < gap:
-            return 0.2 * (released / gap)
-        if released <= 2 * gap:
-            return 1.0 - ((released - gap) / max(1.0, gap))
-        return -0.5 * ((released - 2 * gap) / max(1.0, gap))
+        # New conservative rule:
+        # the victim should be strong enough to cover the current request need,
+        # not only the immediate gap. Otherwise the victim itself is likely a
+        # weak request and pause would be unfair.
+        if released <= need_token_num:
+            return -10.0
+        # Prefer victims that clearly dominate the current request size, but do
+        # not reward arbitrarily huge requests forever.
+        ratio = released / max(1.0, float(need_token_num))
+        if ratio < 1.25:
+            return 0.2
+        if ratio <= 3.0:
+            return 1.5
+        if ratio <= 6.0:
+            return 1.0
+        return 0.3
 
-    def _victim_score(self, req, gap: int) -> float:
-        usefulness = self._release_usefulness(req, gap)
+    def _victim_score(self, req, gap: int, need_token_num: int) -> float:
+        usefulness = self._release_usefulness(req, gap, need_token_num)
         recompute_penalty = self._recompute_penalty(req)
         starvation_penalty = self._starvation_penalty(req)
         return usefulness - recompute_penalty - starvation_penalty
@@ -95,24 +106,14 @@ class FairPauseMemoryScheduler(MemoryScheduler):
         if not candidates:
             return []
 
-        # First try a single-victim best candidate that covers the gap and
-        # still offers acceptable net gain.
-        single_candidates = [req for req in candidates if req.cur_kv_len >= gap]
+        # Conservative replacement rule:
+        # a single victim must be able to release more space than the current
+        # request itself needs, not merely fill the current gap.
+        single_candidates = [req for req in candidates if req.cur_kv_len > need_token_num]
         if single_candidates:
-            single_candidates.sort(key=lambda req: self._victim_score(req, gap), reverse=True)
-            if self._victim_score(single_candidates[0], gap) > -1.0:
+            single_candidates.sort(key=lambda req: self._victim_score(req, gap, need_token_num), reverse=True)
+            if self._victim_score(single_candidates[0], gap, need_token_num) > -1.0:
                 return [single_candidates[0]]
 
-        # Otherwise greedily accumulate candidates with the highest net gain.
-        candidates.sort(key=lambda req: self._victim_score(req, gap), reverse=True)
-
-        released = 0
-        victims = []
-        for req in candidates:
-            if self._victim_score(req, gap) <= -2.0:
-                continue
-            victims.append(req)
-            released += req.cur_kv_len
-            if can_alloc_token_num + released >= need_token_num:
-                break
-        return victims
+        # If no strong enough single victim exists, do not replace.
+        return []
