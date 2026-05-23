@@ -15,11 +15,6 @@ class FairPauseMemoryScheduler(MemoryScheduler):
     repeated-pause protection.
     """
 
-    def _estimate_standalone_latency(self, req) -> float:
-        prompt_tokens = max(1, req.shm_req.input_len)
-        output_budget = max(1, req.sampling_param.shm_param.max_new_tokens)
-        return float(prompt_tokens + output_budget)
-
     def _progress_score(self, req) -> float:
         output_budget = max(1, req.sampling_param.shm_param.max_new_tokens)
         output_progress = min(1.0, float(req.cur_output_len) / float(output_budget))
@@ -29,15 +24,15 @@ class FairPauseMemoryScheduler(MemoryScheduler):
 
     def _recompute_penalty(self, req) -> float:
         progress = self._progress_score(req)
-        standalone_latency = self._estimate_standalone_latency(req)
+        standalone_latency = self.estimate_standalone_latency(req)
         return (0.6 * progress) + (0.4 * float(req.cur_kv_len) / standalone_latency)
 
     def _wait_debt(self, req) -> float:
         now = time.time()
         current_wait = 0.0
         if req.paused and req.last_pause_ts > 0:
-            current_wait = max(0.0, now - req.last_pause_ts)
-        return (req.total_wait_time + current_wait) / max(1.0, self._estimate_standalone_latency(req))
+            current_wait = max(0.0, now - req.last_wait_refresh_ts)
+        return (req.total_wait_time + current_wait) / max(1.0, self.estimate_standalone_latency(req))
 
     def _resume_progress(self, req) -> int:
         return max(0, req.cur_output_len - req.output_tokens_at_resume)
@@ -64,20 +59,13 @@ class FairPauseMemoryScheduler(MemoryScheduler):
         if gap <= 0:
             return 0.0
         released = float(req.cur_kv_len)
-        # New conservative rule:
-        # the victim should be strong enough to cover the current request need,
-        # not only the immediate gap. Otherwise the victim itself is likely a
-        # weak request and pause would be unfair.
-        if released <= need_token_num:
-            return -10.0
-        # Prefer victims that clearly dominate the current request size, but do
-        # not reward arbitrarily huge requests forever.
+        min_ratio = max(1.0, float(self.args.victim_min_ratio_to_need))
         ratio = released / max(1.0, float(need_token_num))
-        if ratio < 1.25:
-            return 0.2
-        if ratio <= 3.0:
+        if ratio <= min_ratio:
+            return -10.0
+        if ratio <= min_ratio * 1.5:
             return 1.5
-        if ratio <= 6.0:
+        if ratio <= min_ratio * 2.5:
             return 1.0
         return 0.3
 
@@ -106,14 +94,18 @@ class FairPauseMemoryScheduler(MemoryScheduler):
         if not candidates:
             return []
 
-        # Conservative replacement rule:
-        # a single victim must be able to release more space than the current
-        # request itself needs, not merely fill the current gap.
-        single_candidates = [req for req in candidates if req.cur_kv_len > need_token_num]
+        current_avg_wait = self.avg_wait_ratio
+        min_need = need_token_num * max(1.0, float(self.args.victim_min_ratio_to_need))
+        single_candidates = [
+            req
+            for req in candidates
+            if req.cur_kv_len > min_need and self._wait_debt(req) <= current_avg_wait
+        ]
         if single_candidates:
             single_candidates.sort(key=lambda req: self._victim_score(req, gap, need_token_num), reverse=True)
             if self._victim_score(single_candidates[0], gap, need_token_num) > -1.0:
                 return [single_candidates[0]]
 
-        # If no strong enough single victim exists, do not replace.
+        # If no strong enough and sufficiently healthy single victim exists,
+        # do not replace.
         return []

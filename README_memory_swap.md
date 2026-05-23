@@ -46,6 +46,8 @@
   - 未来判断请求是否适合走 swap 后端的最小 KV 长度
 - `--victim_policy`
   - victim 选择策略名，当前作为预留参数
+- `--victim_min_ratio_to_need`
+  - victim 释放量必须至少达到当前请求需求的多少倍，默认 `5.0`
 
 ### 2.2 新增 `memory_scheduler` 目录
 
@@ -93,6 +95,10 @@
 - `last_pause_ts`
 - `last_resume_ts`
 - `total_wait_time`
+- `last_wait_refresh_ts`
+- `last_start_ts`
+- `finish_ts`
+- `last_execution_time`
 - `output_tokens_at_resume`
 
 这些字段的作用是：
@@ -106,7 +112,15 @@
 - `last_resume_ts`
   - 记录最近一次恢复的时间
 - `total_wait_time`
-  - 累积请求在 paused 状态下的等待时间
+  - 累积请求在所有等待轮次中的等待时间
+- `last_wait_refresh_ts`
+  - 当前这一轮等待的起点
+- `last_start_ts`
+  - 最近一次真正开始执行的时间
+- `finish_ts`
+  - 请求完成时刻
+- `last_execution_time`
+  - 定义为 `finish_ts - last_start_ts`
 - `output_tokens_at_resume`
   - 用来判断请求恢复后是否已经取得足够进度，避免刚恢复又立刻被再次暂停
 
@@ -116,6 +130,16 @@
 - `recover_paused_reqs()`
 
 中已经接入这些状态的更新逻辑。
+
+当前版本中，时间语义定义为：
+
+- **等待时间**
+  - 本次开始执行时刻减去本轮等待起点
+  - 初次执行时，等待起点是 `enqueue_ts`
+  - 每次被 pause 后，等待起点会刷新为 `last_pause_ts`
+- **执行时间**
+  - `finish_ts - last_start_ts`
+  - 表示最后一次恢复/开始执行到完成之间的执行时长
 
 ## 3. 当前逻辑和原版 LightLLM 的区别
 
@@ -163,7 +187,7 @@ victim_score =
 
 - 太小：对当前请求帮助不够，不值得抢占
 - 只略高于当前显存缺口：不够理想，因为这类 victim 往往本身也偏弱
-- **必须大于当前请求本身所需的 token 空间**，而不只是大于 gap
+- **必须大于当前请求本身所需的 token 空间的固定倍数**，默认是 `5 倍`
 - 明显大于当前请求所需空间：收益更好，因为 pause 代价更容易被摊薄
 - 如果不存在这样的单个 victim：当前版本直接放弃替代，不再拼多个 victim
 
@@ -203,6 +227,23 @@ wait_debt = accumulated_wait / estimated_standalone_latency
 - 不是只看一个请求绝对等了多久
 - 而是看相对于它本来应有的完成时间，它已经被拖得多惨
 
+另外，当前版本会维护一个全局：
+
+```text
+avg_wait_ratio
+```
+
+它来自：
+
+- 每个请求完成后
+- 记录该请求的：
+  - `累计等待时间 / 预计独立完成时间`
+- 再按 **实际执行时间** 作为权重并入系统平均等待比
+
+因此当前策略额外要求：
+
+> 如果一个候选 victim 的等待债务已经高于当前平均等待比，那么它不应再被替换。
+
 ### 4.4 反饥饿保护 `starvation_penalty`
 
 当前实现里，以下情况都会提高 victim 惩罚：
@@ -228,8 +269,9 @@ wait_debt = accumulated_wait / estimated_standalone_latency
    - 已 finished
    - 刚恢复且还在冷却期的请求
 3. 优先尝试寻找：
-   - 单个就能释放出 **大于当前请求所需 token** 的空间
+   - 单个就能释放出 **大于当前请求所需 token 固定倍数** 的空间
    - 且净收益更合理的 victim
+   - 且该 victim 的等待债务不高于当前平均等待比
 4. 如果找不到这样的单个 victim：
    - 当前版本直接放弃替代，不再组合多个弱 victim
 

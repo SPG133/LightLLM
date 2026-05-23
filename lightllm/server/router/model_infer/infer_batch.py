@@ -310,8 +310,7 @@ class InferenceContext:
                 req.paused = True
                 req.pause_count += 1
                 req.last_pause_ts = time.time()
-                if req.last_resume_ts > 0:
-                    req.total_wait_time += max(0.0, req.last_pause_ts - req.last_resume_ts)
+                req.last_wait_refresh_ts = req.last_pause_ts
                 if is_master_in_dp:
                     req.shm_req.is_paused = True
                     logger.debug(f"infer paused req id {req.req_id}")
@@ -530,6 +529,10 @@ class InferReq:
         self.last_pause_ts = 0.0
         self.last_resume_ts = 0.0
         self.total_wait_time = 0.0
+        self.last_wait_refresh_ts = self.enqueue_ts
+        self.last_start_ts = 0.0
+        self.finish_ts = 0.0
+        self.last_execution_time = 0.0
         self.output_tokens_at_resume = 0
 
         self.infer_aborted = False

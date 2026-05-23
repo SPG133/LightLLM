@@ -713,6 +713,9 @@ class ModeBackend:
         else:
             true_finished_reqs = finished_reqs
 
+        for req in true_finished_reqs:
+            self.memory_scheduler.on_req_finished(req)
+
         g_infer_context.filter_reqs(finished_reqs=true_finished_reqs)
         g_infer_context.pause_reqs(wait_pause_reqs, is_master_in_dp=self.is_master_in_dp)
 
@@ -737,8 +740,12 @@ class ModeBackend:
         update_func_objs: List[InferReqUpdatePack] = []
         # 通用状态预先填充
         is_master_in_dp = self.is_master_in_dp
+        now = time.time()
         for req_obj in run_reqs:
             req_obj: InferReq = req_obj
+            if req_obj.last_start_ts <= 0 or req_obj.last_start_ts < req_obj.last_wait_refresh_ts:
+                req_obj.total_wait_time += max(0.0, now - req_obj.last_wait_refresh_ts)
+                req_obj.last_start_ts = now
             if is_chuncked_mode:
                 new_kv_len = req_obj.get_chuncked_input_token_len()
             else:

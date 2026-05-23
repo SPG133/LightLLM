@@ -186,6 +186,7 @@ class StartArgs:
     swap_block_size: int = field(default=128)
     swap_threshold_tokens: int = field(default=4096)
     victim_policy: str = field(default="kv_idle_fair")
+    victim_min_ratio_to_need: float = field(default=5.0)
     # zmp ports
     router_port: int = field(default=None)
     detokenization_port: int = field(default=None)

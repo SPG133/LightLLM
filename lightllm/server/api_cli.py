@@ -803,6 +803,12 @@ def make_argument_parser() -> argparse.ArgumentParser:
         help="""Victim selection policy for memory-aware scheduling.""",
     )
     parser.add_argument(
+        "--victim_min_ratio_to_need",
+        type=float,
+        default=5.0,
+        help="""A victim must release at least this multiple of the current request need.""",
+    )
+    parser.add_argument(
         "--linear_att_hash_page_size",
         type=int,
         default=512,
