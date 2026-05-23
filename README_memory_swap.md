@@ -162,82 +162,100 @@
 
 ## 4. 当前 `fair_pause` 的策略
 
-当前的 `FairPauseMemoryScheduler` 已经不是最初那种“只看谁的 KV 更大”的简单启发式了。
+当前版本的 `FairPauseMemoryScheduler` 已经被收缩成一个最简版本，只保留两条规则。
 
-它现在综合考虑四类因素：
+### 4.1 规则一：只有强势任务才允许被替换
 
-- 释放收益：这个 victim 让出的 KV 是否对当前缺口有足够帮助
-- 重算代价：pause 这个 victim 后，将来恢复重算会有多贵
-- 等待债务：这个 victim 是否已经被拖了太久
-- 反饥饿保护：它是否最近刚恢复、刚被 pause 过，或者恢复后还没取得足够进度
-
-可以把它概括成：
+一个候选 victim 必须满足：
 
 ```text
-victim_score =
-    release_usefulness
-  - recompute_penalty
-  - starvation_penalty
+victim.cur_kv_len > a * current_request_need
 ```
 
-### 4.1 释放收益 `release_usefulness`
+其中：
 
-当前实现中，victim 让出的 KV 不是简单追求“刚好贴近缺口”，而是强调：
-
-- 太小：对当前请求帮助不够，不值得抢占
-- 只略高于当前显存缺口：不够理想，因为这类 victim 往往本身也偏弱
-- **必须大于当前请求本身所需的 token 空间的固定倍数**，默认是 `5 倍`
-- 明显大于当前请求所需空间：收益更好，因为 pause 代价更容易被摊薄
-- 如果不存在这样的单个 victim：当前版本直接放弃替代，不再拼多个 victim
-
-也就是说，它已经不是“最大请求优先”，而更接近：
-
-```text
-强势任务让位优先
-```
-
-### 4.2 重算代价 `recompute_penalty`
-
-当前实现中，重算代价近似依赖于：
-
-- 当前逻辑完成度
-- 当前 `cur_kv_len`
-
-这里没有再沿用最初“只看显存大小”的方式，而是近似考虑：
-
-- `cur_output_len / max_new_tokens`
-- `cur_kv_len / (input_len + max_new_tokens)`
-
-所以：
-
-- 越接近完成的请求，越不适合作为 victim
-- 当前 KV 越大，越不适合作为 victim
-
-### 4.3 等待债务 `wait_debt`
-
-当前实现引入了等待债务：
-
-```text
-wait_debt = accumulated_wait / estimated_standalone_latency
-```
+- `current_request_need` 是当前请求本轮所需的 token 空间
+- `a` 由参数 `--victim_min_ratio_to_need` 控制
+- 当前默认值是 `5.0`
 
 这表示：
 
-- 不是只看一个请求绝对等了多久
-- 而是看相对于它本来应有的完成时间，它已经被拖得多惨
+- 不是任何显存更大的任务都能被抢占
+- 只有明显比当前请求“强势”的大任务，才有资格为它让位
+- 如果找不到这样的单个大任务，就不做替换
 
-另外，当前版本会维护一个全局：
+### 4.2 规则二：等待比例高于平均值的任务不能再被替换
+
+对于每个请求，当前版本定义：
+
+```text
+wait_ratio = waiting_time / estimated_standalone_latency
+```
+
+其中：
+
+- `waiting_time`
+  - 如果请求当前还在等待，则为：`当前时刻 - 入队时刻`
+  - 如果请求已经开始执行，则为：`上次开始执行时刻 - 入队时刻`
+- `estimated_standalone_latency`
+  - 当前版本的近似估计为：`input_len + max_new_tokens`
+
+同时系统维护一个全局：
 
 ```text
 avg_wait_ratio
 ```
 
-它来自：
+它的更新方式是：
 
 - 每个请求完成后
-- 记录该请求的：
-  - `累计等待时间 / 预计独立完成时间`
-- 再按 **实际执行时间** 作为权重并入系统平均等待比
+- 计算该请求的：
+  - `wait_ratio = total_wait_time / estimated_standalone_latency`
+- 再按 **实际执行时间** 加权更新平均等待比例
+
+因此，一个候选 victim 还必须满足：
+
+```text
+victim.wait_ratio <= avg_wait_ratio
+```
+
+也就是说：
+
+- 如果一个任务的等待比例已经高于当前系统平均等待比例
+- 就不应该再继续替换它
+
+### 4.3 当前 victim 选择流程
+
+当前 `select_victims()` 的流程是：
+
+1. 取当前请求本轮所需的 token 空间 `need_token_num`
+2. 过滤掉：
+   - 已经 paused
+   - 已经 `wait_pause`
+   - 已 finished
+3. 在剩余请求中筛选：
+   - `req.cur_kv_len > a * need_token_num`
+   - `req.wait_ratio <= avg_wait_ratio`
+4. 如果没有这样的候选，请求不替换任何任务
+5. 如果有多个候选，则选择其中 `cur_kv_len` 最小的那个
+
+所以当前策略已经不再是：
+
+```text
+谁的 KV 最大就暂停谁
+```
+
+也不是：
+
+```text
+哪个请求先撞上资源不足，哪个请求自己暂停
+```
+
+而是：
+
+```text
+只有明显更强势、且等待比例不高于平均值的任务，才允许被替换
+```
 
 因此当前策略额外要求：
 
