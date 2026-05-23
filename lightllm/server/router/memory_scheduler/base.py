@@ -15,6 +15,8 @@ class MemoryScheduler:
         self.args = args
         self.avg_wait_ratio = 0.0
         self.finished_req_count = 0
+        self.weighted_wait_ratio_sum = 0.0
+        self.total_execution_weight = 0.0
 
     def select_victims(self, running_reqs: List, need_token_num: int, can_alloc_token_num: int) -> List:
         return []

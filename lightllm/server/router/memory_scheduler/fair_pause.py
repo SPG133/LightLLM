@@ -29,10 +29,13 @@ class FairPauseMemoryScheduler(MemoryScheduler):
 
     def _wait_debt(self, req) -> float:
         now = time.time()
-        current_wait = 0.0
-        if req.paused and req.last_pause_ts > 0:
-            current_wait = max(0.0, now - req.last_wait_refresh_ts)
-        return (req.total_wait_time + current_wait) / max(1.0, self.estimate_standalone_latency(req))
+        if req.paused:
+            wait_time = max(0.0, now - req.enqueue_ts)
+        elif req.last_start_ts > 0:
+            wait_time = max(0.0, req.last_start_ts - req.enqueue_ts)
+        else:
+            wait_time = max(0.0, now - req.enqueue_ts)
+        return wait_time / max(1.0, self.estimate_standalone_latency(req))
 
     def _resume_progress(self, req) -> int:
         return max(0, req.cur_output_len - req.output_tokens_at_resume)

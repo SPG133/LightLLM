@@ -744,7 +744,7 @@ class ModeBackend:
         for req_obj in run_reqs:
             req_obj: InferReq = req_obj
             if req_obj.last_start_ts <= 0 or req_obj.last_start_ts < req_obj.last_wait_refresh_ts:
-                req_obj.total_wait_time += max(0.0, now - req_obj.last_wait_refresh_ts)
+                req_obj.total_wait_time = max(0.0, now - req_obj.enqueue_ts)
                 req_obj.last_start_ts = now
             if is_chuncked_mode:
                 new_kv_len = req_obj.get_chuncked_input_token_len()
